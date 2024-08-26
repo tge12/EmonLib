@@ -11,13 +11,13 @@
 #define EmonLib_h
 
 #if defined(ARDUINO) && ARDUINO >= 100
-
-#include "Arduino.h"
-
+# include "Arduino.h"
 #else
-
-#include "WProgram.h"
-
+# ifdef RPI_PICO
+#  include "RPiPicoEmul.h"
+# else
+#  include "WProgram.h"
+# endif
 #endif
 
 // define theoretical vref calibration constant for use in readvcc()
@@ -41,6 +41,8 @@
 
 #define ADC_COUNTS  (1<<ADC_BITS)
 
+#define CALIBRATION_NUM_SAMPLES 1000
+#define PHASECAL_BUFFER_SIZE    128 // Must be power of 2!!
 
 class EnergyMonitor
 {
@@ -52,7 +54,7 @@ class EnergyMonitor
     void voltageTX(double _VCAL, double _PHASECAL);
     void currentTX(unsigned int _channel, double _ICAL);
 
-    void calcVI(unsigned int crossings, unsigned int timeout);
+    void calcVI(unsigned int crossings, unsigned int timeout, unsigned int loopDelay = 0);
     double calcIrms(unsigned int NUMBER_OF_SAMPLES);
     void serialprint();
 

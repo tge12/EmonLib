@@ -13,11 +13,17 @@
 #include "EmonLib.h"
 
 #if defined(ARDUINO) && ARDUINO >= 100
-#include "Arduino.h"
+# include "Arduino.h"
 #else
-#include "WProgram.h"
+# ifdef RPI_PICO
+#  include <stdio.h>
+#  include <sys/time.h>
+#  include "pico/stdlib.h"
+#  include "RPiPicoEmul.h"
+# else
+#  include "WProgram.h"
+# endif
 #endif
-
 
 //--------------------------------------------------------------------------------------
 // Sets the pins to be used for voltage and current sensors
@@ -63,7 +69,7 @@ void EnergyMonitor::currentTX(unsigned int _channel, double _ICAL)
 // From a sample window of the mains AC voltage and current.
 // The Sample window length is defined by the number of half wavelengths or crossings we choose to measure.
 //--------------------------------------------------------------------------------------
-void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
+void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout, unsigned int loopDelay)
 {
   #if defined emonTxV3
   int SupplyVoltage=3300;
@@ -86,6 +92,34 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     if ((millis()-start)>timeout) break;
   }
 
+#ifdef CALIBRATION
+
+  // ------------------------------------------------------------------------
+  // General info and current values at start of this call
+  // Especially needed for calibration simulator is "Start Offsets"
+  // ------------------------------------------------------------------------
+
+  printf("PIN I: %d, U: %d\n", inPinI, inPinV);
+  printf("ADC range: %d\n", ADC_COUNTS);
+  printf("Supply: %dmV, vCal: %.2f, phaseCal: %.2f\n", SupplyVoltage, VCAL, PHASECAL);
+  unsigned long now = millis();
+  printf("Start %ld Timeout: %ld, now: %ld -> %ldms\n", start, timeout, now, (now - start));
+  printf("Start Offsets: I: %.2f U: %.2f\n", offsetI, offsetV);
+  struct timeval t1;
+  struct timeval tLast;
+
+  uint samplesI[CALIBRATION_NUM_SAMPLES];
+  uint samplesV[CALIBRATION_NUM_SAMPLES];
+  unsigned long samplesT[CALIBRATION_NUM_SAMPLES];
+
+  gettimeofday(&t1, NULL);
+
+#endif // CALIBRATION_NUM_SAMPLES
+
+  uint phaseCalInt = (uint) PHASECAL; // as int type
+  double phaseShiftedI;
+  double pcSamples[PHASECAL_BUFFER_SIZE]; // PHASECAL cannot be more than this
+
   //-------------------------------------------------------------------------------------------------------------------------
   // 2) Main measurement loop
   //-------------------------------------------------------------------------------------------------------------------------
@@ -99,6 +133,13 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     //-----------------------------------------------------------------------------
     // A) Read in raw voltage and current samples
     //-----------------------------------------------------------------------------
+
+#ifdef CALIBRATION
+    // Determine the time needed for this loop cycle
+    tLast = t1;
+    gettimeofday(&t1, NULL);
+#endif // CALIBRATION
+
     sampleV = analogRead(inPinV);                 //Read in raw voltage signal
     sampleI = analogRead(inPinI);                 //Read in raw current signal
 
@@ -126,12 +167,47 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     //-----------------------------------------------------------------------------
     // E) Phase calibration
     //-----------------------------------------------------------------------------
-    phaseShiftedV = lastFilteredV + PHASECAL * (filteredV - lastFilteredV);
+    if(phaseCalInt > 2)
+    {
+      // -------------------------------------------------------------- 
+      // phaseCal > 2 means that V is ahead of I more than the time needed for one loop cycle.
+      // Especially needed with high sampling rates (here the deltaT is so small, that the classic
+      // phase calibration has no sufficient effect anymore).
+      // The actual phaseCal value can be determined using the simulation spreadsheet.
+      // Idea is to use an I sample value <phaseCal> samples in the past.
+      // See for example (phaseCal = 26):
+      //  https://community.openenergymonitor.org/t/sct013-value-consistently-too-low/26480/20
+      // -------------------------------------------------------------- 
+
+      // Store PHASECAL_BUFFER_SIZE samples in a circular buffer
+      pcSamples[numberOfSamples & (PHASECAL_BUFFER_SIZE - 1)] = filteredI;
+
+      // We want the sample index "phaseCalInt" in the past
+      uint refSample = numberOfSamples - phaseCalInt;
+
+      // Chose val depending on whether we already have that val, if so determine right index in circular buffer
+      phaseShiftedI = (refSample > 0 ? pcSamples[refSample & (PHASECAL_BUFFER_SIZE - 1)] : 0);
+      phaseShiftedV = filteredV;
+    }
+    else if(phaseCalInt < 0)
+    {
+      // Same thing with I being ahead of V
+      pcSamples[numberOfSamples & (PHASECAL_BUFFER_SIZE - 1)] = filteredV;
+      uint refSample = numberOfSamples - phaseCalInt;
+      phaseShiftedV = (refSample > 0 ? pcSamples[refSample & (PHASECAL_BUFFER_SIZE - 1)] : 0);
+      phaseShiftedI = filteredI;
+    }
+    else
+    {
+      // "Classic" phase calibration, tune V value with previous sample
+      phaseShiftedV = lastFilteredV + PHASECAL * (filteredV - lastFilteredV);
+      phaseShiftedI = filteredI;
+    }
 
     //-----------------------------------------------------------------------------
     // F) Instantaneous power calc
     //-----------------------------------------------------------------------------
-    instP = phaseShiftedV * filteredI;          //Instantaneous Power
+    instP = phaseShiftedV * phaseShiftedI;      //Instantaneous Power
     sumP +=instP;                               //Sum
 
     //-----------------------------------------------------------------------------
@@ -145,7 +221,26 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     if (numberOfSamples==1) lastVCross = checkVCross;
 
     if (lastVCross != checkVCross) crossCount++;
+
+    if(loopDelay > 0)
+    {
+      sleep_us(loopDelay);
+    }
+
+#ifdef CALIBRATION
+    // Store sample values of this cycle
+    if(numberOfSamples <= CALIBRATION_NUM_SAMPLES)
+    {
+      samplesI[numberOfSamples - 1] = sampleI;
+      samplesV[numberOfSamples - 1] = sampleV;
+      samplesT[numberOfSamples - 1] = tLast.tv_usec;
+    }
+#endif // CALIBRATION
   }
+
+#ifdef CALIBRATION
+  unsigned long now2 = millis();
+#endif // CALIBRATION
 
   //-------------------------------------------------------------------------------------------------------------------------
   // 3) Post loop calculations
@@ -159,8 +254,19 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
   double I_RATIO = ICAL *((SupplyVoltage/1000.0) / (ADC_COUNTS));
   Irms = I_RATIO * sqrt(sumI / numberOfSamples);
 
+#ifdef CALIBRATION
+  // Print collected sample values in CSV format - ready to load into
+  // calibration simulator spreadsheet
+  printf("End meas loop: %ldms NumSamples: %d (%d)\n", (now2 - now), numberOfSamples, phaseCalInt);
+  printf("t;ADC V;ADC I\n");
+  for(int i = 0; (i < CALIBRATION_NUM_SAMPLES && i < numberOfSamples); i++)
+  {
+    printf("%ld;%d;%d\n", samplesT[i], samplesV[i], samplesI[i]);
+  }
+#endif // CALIBRATION
+
   //Calculation power values
-  realPower = V_RATIO * I_RATIO * sumP / numberOfSamples;
+  realPower = V_RATIO * I_RATIO * sumP / (phaseCalInt > 2 ? (numberOfSamples - phaseCalInt) : numberOfSamples);
   apparentPower = Vrms * Irms;
   powerFactor=realPower / apparentPower;
 
